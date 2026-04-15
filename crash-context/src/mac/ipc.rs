@@ -110,6 +110,10 @@ const FLAG_HAS_SUBCODE: u32 = 0x2;
 struct AcknowledgementMessage {
     head: MachMsgHeader,
     result: u32,
+    /// The kernel appends a trailer to every received mach message.
+    /// Without this field the receive buffer is too small and `mach_msg`
+    /// returns `MACH_RCV_TOO_LARGE`.
+    trailer: MachMsgTrailer,
 }
 
 /// An error that can occur while interacting with mach ports
@@ -441,13 +445,17 @@ impl Acknowledger {
                 let mut msg = AcknowledgementMessage {
                     head: MachMsgHeader {
                         bits: msg::MACH_MSG_TYPE_COPY_SEND,
-                        size: std::mem::size_of::<AcknowledgementMessage>() as u32,
+                        // Send size excludes the trailer — the kernel appends
+                        // it on the receiver side.
+                        size: (std::mem::size_of::<AcknowledgementMessage>()
+                            - std::mem::size_of::<MachMsgTrailer>()) as u32,
                         remote_port: port,
                         local_port: port::MACH_PORT_NULL,
                         voucher_port: port::MACH_PORT_NULL,
                         id: 0,
                     },
                     result: ack,
+                    trailer: MachMsgTrailer { kind: 0, size: 0 },
                 };
 
                 // Try to actually send the message
@@ -522,21 +530,26 @@ impl AckReceiver {
             let mut ack = AcknowledgementMessage {
                 head: MachMsgHeader {
                     bits: 0,
-                    size: std::mem::size_of::<AcknowledgementMessage>() as u32,
+                    // head.size is the send size, not the receive buffer size.
+                    // We set it to 0 since we are only receiving here.
+                    size: 0,
                     remote_port: port::MACH_PORT_NULL,
                     local_port: self.port,
                     voucher_port: port::MACH_PORT_NULL,
                     id: 0,
                 },
                 result: 0,
+                trailer: MachMsgTrailer { kind: 0, size: 0 },
             };
 
-            // Wait for a response from the Server
+            // Wait for a response from the Server.
+            // The receive buffer size (4th arg) must include space for the
+            // kernel-appended trailer, so we use the full struct size.
             msg!(msg::mach_msg(
                 ((&mut ack.head) as *mut MachMsgHeader).cast(),
                 msg::MACH_RCV_MSG | msg::MACH_RCV_TIMEOUT,
                 0,
-                ack.head.size,
+                std::mem::size_of::<AcknowledgementMessage>() as u32,
                 self.port,
                 timeout.map(|t| t.as_millis() as u32).unwrap_or_default(),
                 port::MACH_PORT_NULL
