@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- Fixed IPC message framing reliability on the macOS/Windows `AF_UNIX` stream transports. Partial reads are now accumulated by a stateful receiver and partial writes are retried by a send loop, so messages can no longer be misframed; `WouldBlock` is no longer misinterpreted as a client disconnect; and accepted sockets are explicitly set non-blocking (required on macOS, where `accept` does not inherit the flag). The Linux `SOCK_SEQPACKET` path retains its atomic receive and now validates datagram length.
+
 ## [0.11.0] - 2026-07-20
 ### Changed
 - [PR#122](https://github.com/EmbarkStudios/crash-handling/pull/122) updated `minidump-writer` to 0.13 and `crash-context` to 0.8.0.

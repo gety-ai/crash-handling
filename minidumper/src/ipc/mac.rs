@@ -155,17 +155,6 @@ impl Uds {
         }
     }
 
-    fn recv_with_flags(&self, buf: &mut [u8], flags: i32) -> io::Result<usize> {
-        // SAFETY: syscall
-        let read = unsafe { libc::recv(self.0, buf.as_mut_ptr().cast(), buf.len(), flags) };
-
-        if read == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(read as usize)
-        }
-    }
-
     fn recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         // SAFETY: syscall
         let read = unsafe {
@@ -288,13 +277,13 @@ impl UnixStream {
     }
 
     #[inline]
-    pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.recv_with_flags(buf, libc::MSG_PEEK)
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_vectored(&mut [io::IoSliceMut::new(buf)])
     }
 
     #[inline]
-    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.recv_vectored(&mut [io::IoSliceMut::new(buf)])
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.set_nonblocking(nonblocking)
     }
 
     #[inline]

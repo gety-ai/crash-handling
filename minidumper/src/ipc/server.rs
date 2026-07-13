@@ -4,6 +4,44 @@ use polling::{Event, Poller};
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
+/// The size of the fixed message header prefixed to every IPC message.
+const HEADER_SIZE: usize = std::mem::size_of::<Header>();
+
+/// The outcome of attempting to receive a message from a client connection.
+enum RecvOutcome {
+    /// A complete message, with its kind and payload.
+    Message(u32, Vec<u8>),
+    /// Not enough data has arrived yet; the connection should be kept and
+    /// polled again. This must never be treated as a disconnect.
+    Pending,
+    /// The peer performed an orderly shutdown before any bytes of a new message.
+    Eof,
+    /// A real I/O or protocol error occurred; the connection should be dropped.
+    Error(std::io::Error),
+}
+
+/// Maps an I/O error to a [`RecvOutcome`], keeping `WouldBlock` distinct from a
+/// genuine error so that a non-blocking socket with no data ready is not
+/// mistaken for a closed connection.
+fn classify(err: std::io::Error) -> RecvOutcome {
+    if err.kind() == ErrorKind::WouldBlock {
+        RecvOutcome::Pending
+    } else {
+        RecvOutcome::Error(err)
+    }
+}
+
+/// Incremental receive state for byte-stream transports (macOS/Windows). Unlike
+/// Linux SEQPACKET these do not preserve message boundaries, so a single message
+/// may be delivered across multiple readable events.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+enum RecvState {
+    /// Accumulating the fixed-size header.
+    Header { bytes: [u8; HEADER_SIZE], filled: usize },
+    /// Header parsed; accumulating `filled` of `buffer.len()` payload bytes.
+    Payload { kind: u32, buffer: Vec<u8>, filled: usize },
+}
+
 /// Server side of the connection, which runs in the monitor process that is
 /// meant to monitor the process where the [`super::Client`] resides
 pub struct Server {
@@ -26,6 +64,11 @@ struct ClientConn {
     key: usize,
     /// Last time a message was sent from the client
     last_update: Instant,
+    /// Byte-stream transports may deliver a message across several readable
+    /// events, so we track partial-receive progress here. Not needed on Linux,
+    /// where SEQPACKET delivers each message as an atomic datagram.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    recv_state: RecvState,
     /// We pair the pid of the client process so that we know which connection
     /// to drop when a crash is received on the mach port
     #[cfg(target_os = "macos")]
@@ -33,38 +76,180 @@ struct ClientConn {
 }
 
 impl ClientConn {
-    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> Option<(u32, Vec<u8>)> {
-        use std::io::IoSliceMut;
+    /// Receives at most one complete message from the client.
+    ///
+    /// macOS and Windows use `AF_UNIX` byte streams, so a message may arrive
+    /// across several readable events. We drive [`RecvState`] forward using the
+    /// exact number of bytes each `recv` reports, returning [`RecvOutcome::Pending`]
+    /// (never a disconnect) when the socket has no more data ready.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> RecvOutcome {
+        loop {
+            match &mut self.recv_state {
+                RecvState::Header { bytes, filled } => {
+                    let read = match self.socket.recv(&mut bytes[*filled..]) {
+                        Ok(read) => read,
+                        Err(err) => return classify(err),
+                    };
 
-        let mut hdr_buf = [0u8; std::mem::size_of::<Header>()];
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "linux", target_os = "android"))] {
-                let len = self.socket.0.peek(&mut hdr_buf).ok()?;
-            } else {
-                let len = self.socket.peek(&mut hdr_buf).ok()?;
+                    if read == 0 {
+                        return if *filled == 0 {
+                            RecvOutcome::Eof
+                        } else {
+                            RecvOutcome::Error(std::io::Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "peer closed the connection mid-header",
+                            ))
+                        };
+                    }
+
+                    *filled += read;
+                    self.last_update = Instant::now();
+
+                    if *filled < HEADER_SIZE {
+                        continue;
+                    }
+
+                    let header = match Header::from_bytes(bytes) {
+                        Some(header) => header,
+                        None => {
+                            return RecvOutcome::Error(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "received an invalid message header",
+                            ));
+                        }
+                    };
+
+                    if header.size == 0 {
+                        self.recv_state = RecvState::Header {
+                            bytes: [0; HEADER_SIZE],
+                            filled: 0,
+                        };
+                        return RecvOutcome::Message(header.kind, Vec::new());
+                    }
+
+                    let mut buffer = handler.message_alloc();
+                    buffer.resize(header.size as usize, 0);
+                    self.recv_state = RecvState::Payload {
+                        kind: header.kind,
+                        buffer,
+                        filled: 0,
+                    };
+                }
+                RecvState::Payload {
+                    kind,
+                    buffer,
+                    filled,
+                } => {
+                    let read = match self.socket.recv(&mut buffer[*filled..]) {
+                        Ok(read) => read,
+                        Err(err) => return classify(err),
+                    };
+
+                    if read == 0 {
+                        // A half-delivered payload can never be dispatched.
+                        return RecvOutcome::Error(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "peer closed the connection mid-payload",
+                        ));
+                    }
+
+                    *filled += read;
+                    self.last_update = Instant::now();
+
+                    if *filled < buffer.len() {
+                        continue;
+                    }
+
+                    let kind = *kind;
+                    let buffer = std::mem::take(buffer);
+                    self.recv_state = RecvState::Header {
+                        bytes: [0; HEADER_SIZE],
+                        filled: 0,
+                    };
+                    return RecvOutcome::Message(kind, buffer);
+                }
             }
         }
+    }
 
-        if len == 0 {
-            return None;
+    /// Receives at most one complete message from the client.
+    ///
+    /// Linux and Android use `SOCK_SEQPACKET`, which preserves message
+    /// boundaries: a single `recv` consumes exactly one datagram. We therefore
+    /// peek the header to size the payload, then read the whole datagram
+    /// atomically. A stateful reader is neither needed nor safe here, since the
+    /// first `recv` would discard any unread remainder of the datagram.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> RecvOutcome {
+        use std::io::IoSliceMut;
+
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        let peeked = match self.socket.0.peek(&mut hdr_buf) {
+            Ok(peeked) => peeked,
+            Err(err) => return classify(err),
+        };
+
+        if peeked == 0 {
+            return RecvOutcome::Eof;
         }
 
-        let header = Header::from_bytes(&hdr_buf)?;
+        self.last_update = Instant::now();
+
+        if peeked < HEADER_SIZE {
+            return RecvOutcome::Error(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "received an undersized message header",
+            ));
+        }
+
+        let header = match Header::from_bytes(&hdr_buf) {
+            Some(header) => header,
+            None => {
+                return RecvOutcome::Error(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "received an invalid message header",
+                ));
+            }
+        };
 
         if header.size == 0 {
-            self.socket.recv(&mut hdr_buf).ok()?;
-            Some((header.kind, Vec::new()))
-        } else {
-            let mut buffer = handler.message_alloc();
+            // Consume the header-only datagram, validating its length to match
+            // the non-empty path rather than silently accepting a malformed one.
+            let received = match self.socket.recv(&mut hdr_buf) {
+                Ok(received) => received,
+                Err(err) => return classify(err),
+            };
 
-            buffer.resize(header.size as usize, 0);
+            if received != HEADER_SIZE {
+                return RecvOutcome::Error(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "received a malformed zero-length message",
+                ));
+            }
 
-            self.socket
-                .recv_vectored(&mut [IoSliceMut::new(&mut hdr_buf), IoSliceMut::new(&mut buffer)])
-                .ok()?;
-
-            Some((header.kind, buffer))
+            return RecvOutcome::Message(header.kind, Vec::new());
         }
+
+        let mut buffer = handler.message_alloc();
+        buffer.resize(header.size as usize, 0);
+
+        let (received, truncated) = match self
+            .socket
+            .recv_vectored(&mut [IoSliceMut::new(&mut hdr_buf), IoSliceMut::new(&mut buffer)])
+        {
+            Ok(result) => result,
+            Err(err) => return classify(err),
+        };
+
+        if truncated || received != HEADER_SIZE + buffer.len() {
+            return RecvOutcome::Error(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "received a truncated or malformed message",
+            ));
+        }
+
+        RecvOutcome::Message(header.kind, buffer)
     }
 }
 
@@ -248,6 +433,15 @@ impl Server {
                             let key = id;
                             id += 1;
 
+                            // The byte-stream receive path is driven by the
+                            // poller and must never block waiting for the rest
+                            // of a message. Linux connections are already
+                            // non-blocking via `uds::nonblocking`; macOS accept
+                            // does not inherit the listener's flag and Windows'
+                            // inheritance is undocumented, so we set it here.
+                            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                            accepted.set_nonblocking(true)?;
+
                             polling.add(&accepted, Event::readable(key))?;
 
                             log::debug!("accepted connection {key}");
@@ -255,6 +449,11 @@ impl Server {
                                 socket: accepted,
                                 key,
                                 last_update: Instant::now(),
+                                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                                recv_state: RecvState::Header {
+                                    bytes: [0; HEADER_SIZE],
+                                    filled: 0,
+                                },
                                 #[cfg(target_os = "macos")]
                                 pid: None,
                             });
@@ -275,10 +474,8 @@ impl Server {
                     polling.poll.modify(&polling.listener, Event::readable(0))?;
                 } else if let Some(pos) = polling.clients.iter().position(|cc| cc.key == event.key)
                 {
-                    polling.clients[pos].last_update = Instant::now();
-
                     let deregister = match polling.clients[pos].recv(handler.as_ref()) {
-                        Some((super::CRASH, buffer)) => {
+                        RecvOutcome::Message(super::CRASH, buffer) => {
                             cfg_if::cfg_if! {
                                 if #[cfg(target_os = "macos")] {
                                     use scroll::Pread;
@@ -362,7 +559,7 @@ impl Server {
                                 }
                             }
                         }
-                        Some((super::PING, _buffer)) => {
+                        RecvOutcome::Message(super::PING, _buffer) => {
                             let pong = Header {
                                 kind: super::PONG,
                                 size: 0,
@@ -377,8 +574,8 @@ impl Server {
                                 None
                             }
                         }
-                        Some((super::PONG, _buffer)) => None,
-                        Some((kind, buffer)) => {
+                        RecvOutcome::Message(super::PONG, _buffer) => None,
+                        RecvOutcome::Message(kind, buffer) => {
                             handler.on_message(
                                 kind - super::USER, /* give the user back the original code they specified */
                                 buffer,
@@ -391,8 +588,14 @@ impl Server {
 
                             None
                         }
-                        None => {
+                        RecvOutcome::Pending => None,
+                        RecvOutcome::Eof => {
                             log::debug!("client closed socket {pos}");
+                            let cc = polling.clients.swap_remove(pos);
+                            Some(cc.socket)
+                        }
+                        RecvOutcome::Error(err) => {
+                            log::error!("IPC recv failed: {err}");
                             let cc = polling.clients.swap_remove(pos);
                             Some(cc.socket)
                         }

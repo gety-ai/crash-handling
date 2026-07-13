@@ -153,9 +153,10 @@ impl Client {
     /// delivered.
     ///
     /// It is also important to note that this method can be called from multiple
-    /// threads if you so choose. Each message is sent vectored and thus won't
-    /// be split, but if you care about ordering you will need to handle that
-    /// yourself.
+    /// threads if you so choose. Complete delivery of each message is guaranteed
+    /// by an internal write loop rather than by any assumption that a single
+    /// vectored send will not be split, but if you care about ordering you will
+    /// need to handle that yourself.
     ///
     /// # Errors
     ///
@@ -202,9 +203,85 @@ impl Client {
             size: buf.len() as u32,
         };
 
-        let io_bufs = [IoSlice::new(header.as_bytes()), IoSlice::new(buf)];
+        let header_bytes = header.as_bytes();
+        let mut header_offset = 0;
+        let mut payload_offset = 0;
 
-        self.socket.send_vectored(&io_bufs)?;
+        // Client sockets are blocking, so this loop will not busy-spin. On Linux
+        // SEQPACKET a send is atomic (all-or-`EMSGSIZE`), so a message is never
+        // split across datagrams and the loop completes in a single iteration.
+        // On the macOS/Windows byte streams a short write is possible, so we
+        // resend the not-yet-written remainder until the whole frame is out.
+        while header_offset < header_bytes.len() || payload_offset < buf.len() {
+            let io_bufs = [
+                IoSlice::new(&header_bytes[header_offset..]),
+                IoSlice::new(&buf[payload_offset..]),
+            ];
+
+            let written = self.socket.send_vectored(&io_bufs)?;
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "IPC socket write made no progress",
+                )
+                .into());
+            }
+
+            advance_send_offsets(
+                written,
+                header_bytes.len(),
+                &mut header_offset,
+                &mut payload_offset,
+            );
+        }
+
         Ok(())
+    }
+}
+
+/// Advances the header and payload write offsets by `written` bytes, filling the
+/// header before the payload to mirror how the two vectored buffers drain.
+fn advance_send_offsets(
+    written: usize,
+    header_len: usize,
+    header_offset: &mut usize,
+    payload_offset: &mut usize,
+) {
+    let header_remaining = header_len.saturating_sub(*header_offset);
+    let header_written = written.min(header_remaining);
+    *header_offset += header_written;
+    *payload_offset += written - header_written;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_send_offsets;
+
+    #[test]
+    fn advances_across_header_and_payload_boundary() {
+        let (mut header, mut payload) = (0, 0);
+        advance_send_offsets(10, 8, &mut header, &mut payload);
+        assert_eq!((header, payload), (8, 2));
+    }
+
+    #[test]
+    fn advances_only_the_header_while_still_filling_it() {
+        let (mut header, mut payload) = (3, 0);
+        advance_send_offsets(2, 8, &mut header, &mut payload);
+        assert_eq!((header, payload), (5, 0));
+    }
+
+    #[test]
+    fn advances_from_mid_header_into_payload() {
+        let (mut header, mut payload) = (6, 0);
+        advance_send_offsets(5, 8, &mut header, &mut payload);
+        assert_eq!((header, payload), (8, 3));
+    }
+
+    #[test]
+    fn advances_only_the_payload_once_header_is_full() {
+        let (mut header, mut payload) = (8, 4);
+        advance_send_offsets(6, 8, &mut header, &mut payload);
+        assert_eq!((header, payload), (8, 10));
     }
 }

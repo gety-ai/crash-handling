@@ -43,7 +43,6 @@ mod bindings {
     pub type SOCKET = usize;
 
     pub type SEND_RECV_FLAGS = i32;
-    pub const MSG_PEEK: SEND_RECV_FLAGS = 2;
 
     #[repr(C)]
     pub struct OVERLAPPED_0_0 {
@@ -466,13 +465,13 @@ impl UnixStream {
     }
 
     #[inline]
-    pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.recv_with_flags(buf, bindings::MSG_PEEK)
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_vectored(&mut [io::IoSliceMut::new(buf)])
     }
 
     #[inline]
-    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.recv_vectored(&mut [io::IoSliceMut::new(buf)])
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.set_nonblocking(nonblocking)
     }
 
     #[inline]
