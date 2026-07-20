@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+## [0.8.0] - 2026-07-20
+### Changed
+- [PR#122](https://github.com/EmbarkStudios/crash-handling/pull/122) updated `crash-context` to 0.8.0.
+
 ## [0.7.0] - 2026-01-13
 ### Fixed
 - [PR#105](https://github.com/EmbarkStudios/crash-handling/pull/105) fixed pthread interposition when statically linking `musl`.
@@ -95,7 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial pass of crash-context, Linux only
 
 <!-- next-url -->
-[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.7.0...HEAD
+[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.8.0...HEAD
+[0.8.0]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.7.0...crash-handler-0.8.0
 [0.7.0]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.6.3...crash-handler-0.7.0
 [0.6.3]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.6.2...crash-handler-0.6.3
 [0.6.2]: https://github.com/EmbarkStudios/crash-handling/compare/crash-handler-0.6.1...crash-handler-0.6.2
