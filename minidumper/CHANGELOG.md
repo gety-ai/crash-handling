@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Changed
+- [PR#122](https://github.com/EmbarkStudios/crash-handling/pull/122) updated `minidump-writer` to 0.13 and `crash-context` to 0.8.0.
+
 ## [0.10.1] - 2026-05-12
 ### Fixed
 - [PR#117](https://github.com/EmbarkStudios/crash-handling/pull/117) fixed undefined behavior in `Header::from_bytes` by using `std::ptr::read_unaligned` instead.
