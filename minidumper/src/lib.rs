@@ -29,6 +29,21 @@ pub enum LoopAction {
     Continue,
 }
 
+/// The semantic outcome of an acknowledged user message.
+///
+/// Only [`Accepted`](Self::Accepted) means the server handler took ownership of
+/// the message; a successful socket write on its own proves nothing about what
+/// the handler did with it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MessageAck {
+    /// The handler accepted the message and took ownership of it.
+    Accepted,
+    /// The handler understood the message but did not take ownership of it.
+    Rejected,
+    /// The handler has no acknowledged-message semantics for this kind.
+    Unsupported,
+}
+
 /// Allows user code to hook into the server to avoid hardcoding too many details
 pub trait ServerHandler: Send + Sync {
     /// Called when a crash request has been received and a backing file needs
@@ -43,6 +58,18 @@ pub trait ServerHandler: Send + Sync {
     /// Called when the client sends a user message sent from the client with
     /// `send_message`
     fn on_message(&self, kind: u32, buffer: Vec<u8>);
+    /// Called when the client sends a user message with
+    /// [`Client::send_message_acked`](crate::Client::send_message_acked) and is
+    /// waiting for the handler's semantic result.
+    ///
+    /// The default forwards to [`Self::on_message`] so a handler that predates
+    /// this callback never silently drops a message, and answers `Unsupported`
+    /// because only the handler itself can know whether the message was really
+    /// committed.
+    fn on_acknowledged_message(&self, kind: u32, buffer: Vec<u8>) -> MessageAck {
+        self.on_message(kind, buffer);
+        MessageAck::Unsupported
+    }
     /// Optional allocation function for the buffer used to store a message.
     ///
     /// Defaults to creating a new vec.

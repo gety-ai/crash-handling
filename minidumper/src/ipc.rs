@@ -143,6 +143,153 @@ const CRASH_ACK: u32 = 1;
 const PING: u32 = 2;
 const PONG: u32 = 3;
 const USER: u32 = 4;
+/// A user message whose delivery the client wants the handler to confirm.
+const ACKED_USER_MESSAGE: u32 = 0xffff_fffe;
+/// The server's answer to an [`ACKED_USER_MESSAGE`].
+const ACKED_USER_RESPONSE: u32 = 0xffff_ffff;
+/// Wire kinds are `USER + kind`, so user kinds must stay below the reserved
+/// range or a normal message would be indistinguishable from an acknowledged
+/// one on the wire.
+const MAX_USER_KIND_EXCLUSIVE: u32 = ACKED_USER_MESSAGE - USER;
+
+/// `request_id: u64` followed by `user_kind: u32`, ahead of the caller's bytes.
+const ACKED_USER_MESSAGE_PREFIX_SIZE: usize =
+    std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+/// `request_id: u64` followed by the status byte.
+const ACKED_USER_RESPONSE_PAYLOAD_SIZE: usize = std::mem::size_of::<u64>() + 1;
+
+/// Translates a user-facing message kind into its wire kind, rejecting the
+/// kinds that would collide with the acknowledged-message protocol. This is a
+/// runtime check rather than a `debug_assert` because a release build silently
+/// forging a protocol frame is far worse than an error return.
+fn checked_user_kind(kind: u32) -> Result<u32, crate::Error> {
+    if kind >= MAX_USER_KIND_EXCLUSIVE {
+        Err(crate::Error::ProtocolError("user message kind is reserved"))
+    } else {
+        Ok(USER + kind)
+    }
+}
+
+/// All multi-byte protocol fields use native endianness, matching [`Header`],
+/// since both ends of the socket are always the same build.
+fn encode_acked_user_message(request_id: u64, user_kind: u32, payload: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(ACKED_USER_MESSAGE_PREFIX_SIZE + payload.len());
+    encoded.extend_from_slice(&request_id.to_ne_bytes());
+    encoded.extend_from_slice(&user_kind.to_ne_bytes());
+    encoded.extend_from_slice(payload);
+    encoded
+}
+
+fn decode_acked_user_message(mut frame: Vec<u8>) -> Result<(u64, u32, Vec<u8>), crate::Error> {
+    if frame.len() < ACKED_USER_MESSAGE_PREFIX_SIZE {
+        return Err(crate::Error::ProtocolError(
+            "acknowledged user message is too short",
+        ));
+    }
+
+    let payload = frame.split_off(ACKED_USER_MESSAGE_PREFIX_SIZE);
+
+    let mut request_id = [0; std::mem::size_of::<u64>()];
+    request_id.copy_from_slice(&frame[..std::mem::size_of::<u64>()]);
+    let mut user_kind = [0; std::mem::size_of::<u32>()];
+    user_kind.copy_from_slice(&frame[std::mem::size_of::<u64>()..]);
+
+    Ok((
+        u64::from_ne_bytes(request_id),
+        u32::from_ne_bytes(user_kind),
+        payload,
+    ))
+}
+
+fn encode_acked_user_response(
+    request_id: u64,
+    status: crate::MessageAck,
+) -> [u8; ACKED_USER_RESPONSE_PAYLOAD_SIZE] {
+    let mut payload = [0; ACKED_USER_RESPONSE_PAYLOAD_SIZE];
+    payload[..std::mem::size_of::<u64>()].copy_from_slice(&request_id.to_ne_bytes());
+    payload[std::mem::size_of::<u64>()] = match status {
+        crate::MessageAck::Accepted => 0,
+        crate::MessageAck::Rejected => 1,
+        crate::MessageAck::Unsupported => 2,
+    };
+    payload
+}
+
+fn decode_acked_user_response(payload: &[u8]) -> Result<(u64, crate::MessageAck), crate::Error> {
+    if payload.len() != ACKED_USER_RESPONSE_PAYLOAD_SIZE {
+        return Err(crate::Error::ProtocolError(
+            "acknowledged user response has an unexpected size",
+        ));
+    }
+
+    let mut request_id = [0; std::mem::size_of::<u64>()];
+    request_id.copy_from_slice(&payload[..std::mem::size_of::<u64>()]);
+    let status = match payload[std::mem::size_of::<u64>()] {
+        0 => crate::MessageAck::Accepted,
+        1 => crate::MessageAck::Rejected,
+        2 => crate::MessageAck::Unsupported,
+        _ => {
+            return Err(crate::Error::ProtocolError(
+                "acknowledged user response has an unknown status",
+            ));
+        }
+    };
+
+    Ok((u64::from_ne_bytes(request_id), status))
+}
+
+/// Bounds how long a blocking `recv` on the client socket waits, so a response
+/// that never arrives cannot wedge the crash path.
+///
+/// Unix uses `SO_RCVTIMEO` on the raw fd for both socket flavours: `uds` does
+/// not expose timeouts on its seqpacket connection, and going through the fd
+/// keeps one implementation for Linux and macOS.
+fn set_stream_read_timeout(
+    stream: &Stream,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    cfg_if::cfg_if! {
+        if #[cfg(target_os = "windows")] {
+            stream.set_read_timeout(timeout)
+        } else {
+            #[allow(unsafe_code)]
+            {
+                use std::os::unix::io::AsRawFd as _;
+
+                // An all-zero `timeval` disables the timeout, so a positive but
+                // sub-microsecond deadline has to round up to stay a deadline.
+                let timeout = timeout.map_or(
+                    libc::timeval { tv_sec: 0, tv_usec: 0 },
+                    |timeout| {
+                        let tv_sec = timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t;
+                        let tv_usec = timeout.subsec_micros() as libc::suseconds_t;
+                        libc::timeval {
+                            tv_sec,
+                            tv_usec: if tv_sec == 0 && tv_usec == 0 { 1 } else { tv_usec },
+                        }
+                    },
+                );
+
+                // SAFETY: syscall, with a `timeval` of the size `SO_RCVTIMEO` expects
+                let res = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
+                        (&raw const timeout).cast(),
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    )
+                };
+
+                if res == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+        }
+    }
+}
 
 /// A socket name.
 ///
@@ -218,7 +365,12 @@ impl Header {
 
 #[cfg(test)]
 mod test {
-    use super::Header;
+    use super::{
+        ACKED_USER_RESPONSE_PAYLOAD_SIZE, Header, MAX_USER_KIND_EXCLUSIVE, USER, checked_user_kind,
+        decode_acked_user_message, decode_acked_user_response, encode_acked_user_message,
+        encode_acked_user_response,
+    };
+    use crate::{Error, MessageAck};
 
     #[test]
     fn header_bytes() {
@@ -231,5 +383,74 @@ mod test {
         let actual = Header::from_bytes(exp_bytes).unwrap();
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn user_kinds_stop_below_the_reserved_range() {
+        assert_eq!(
+            checked_user_kind(MAX_USER_KIND_EXCLUSIVE - 1).unwrap(),
+            USER + MAX_USER_KIND_EXCLUSIVE - 1
+        );
+        assert!(matches!(
+            checked_user_kind(MAX_USER_KIND_EXCLUSIVE),
+            Err(Error::ProtocolError("user message kind is reserved"))
+        ));
+    }
+
+    #[test]
+    fn acked_user_message_roundtrips() {
+        let encoded = encode_acked_user_message(0x0102_0304_0506_0708, 42, b"semantic payload");
+        let (request_id, user_kind, payload) = decode_acked_user_message(encoded).unwrap();
+
+        assert_eq!(request_id, 0x0102_0304_0506_0708);
+        assert_eq!(user_kind, 42);
+        assert_eq!(payload, b"semantic payload");
+    }
+
+    #[test]
+    fn acked_user_message_roundtrips_an_empty_payload() {
+        let encoded = encode_acked_user_message(1, 0, &[]);
+        assert_eq!(decode_acked_user_message(encoded).unwrap(), (1, 0, vec![]));
+    }
+
+    #[test]
+    fn acked_user_message_rejects_a_truncated_prefix() {
+        assert!(matches!(
+            decode_acked_user_message(vec![0; 11]),
+            Err(Error::ProtocolError(
+                "acknowledged user message is too short"
+            ))
+        ));
+    }
+
+    #[test]
+    fn acked_user_response_statuses_roundtrip() {
+        for status in [
+            MessageAck::Accepted,
+            MessageAck::Rejected,
+            MessageAck::Unsupported,
+        ] {
+            let encoded = encode_acked_user_response(99, status);
+            assert_eq!(decode_acked_user_response(&encoded).unwrap(), (99, status));
+        }
+    }
+
+    #[test]
+    fn acked_user_response_rejects_a_mis_sized_payload() {
+        assert!(decode_acked_user_response(&[0; ACKED_USER_RESPONSE_PAYLOAD_SIZE - 1]).is_err());
+        assert!(decode_acked_user_response(&[0; ACKED_USER_RESPONSE_PAYLOAD_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn acked_user_response_rejects_an_unknown_status() {
+        let mut encoded = encode_acked_user_response(7, MessageAck::Accepted);
+        encoded[std::mem::size_of::<u64>()] = u8::MAX;
+
+        assert!(matches!(
+            decode_acked_user_response(&encoded),
+            Err(Error::ProtocolError(
+                "acknowledged user response has an unknown status"
+            ))
+        ));
     }
 }

@@ -17,6 +17,8 @@ mod bindings {
     pub const PF_UNIX: i32 = 1;
     pub const SOCK_STREAM: i32 = 1;
     pub const FIONBIO: i32 = -2147195266;
+    pub const SOL_SOCKET: i32 = 0xffff;
+    pub const SO_RCVTIMEO: i32 = 0x1006;
     pub const INVALID_SOCKET: usize = !0;
     pub const SD_SEND: u32 = 1;
     pub const SOCKET_ERROR: i32 = -1;
@@ -111,6 +113,13 @@ mod bindings {
         pub fn bind(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
         pub fn listen(s: SOCKET, backlog: i32) -> i32;
         pub fn connect(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
+        pub fn setsockopt(
+            s: SOCKET,
+            level: i32,
+            optname: i32,
+            optval: *const u8,
+            optlen: i32,
+        ) -> i32;
     }
 }
 
@@ -232,6 +241,32 @@ impl Socket {
         // SAFETY: syscall
         let r = unsafe { bindings::ioctlsocket(self.0, bindings::FIONBIO, &mut nonblocking) };
         if r == 0 {
+            Ok(())
+        } else {
+            Err(last_socket_error())
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        // Winsock takes `SO_RCVTIMEO` as a millisecond `DWORD` where zero means
+        // "block forever", so a positive sub-millisecond deadline has to round
+        // up to stay a deadline.
+        let timeout_ms = timeout.map_or(0, |timeout| {
+            timeout.as_millis().clamp(1, u32::MAX as u128) as u32
+        });
+
+        // SAFETY: syscall, with a `DWORD` of the size `SO_RCVTIMEO` expects
+        let result = unsafe {
+            bindings::setsockopt(
+                self.0,
+                bindings::SOL_SOCKET,
+                bindings::SO_RCVTIMEO,
+                (&raw const timeout_ms).cast(),
+                std::mem::size_of_val(&timeout_ms) as i32,
+            )
+        };
+
+        if result == 0 {
             Ok(())
         } else {
             Err(last_socket_error())
@@ -472,6 +507,11 @@ impl UnixStream {
     #[inline]
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.0.set_nonblocking(nonblocking)
+    }
+
+    #[inline]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_read_timeout(timeout)
     }
 
     #[inline]

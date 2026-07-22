@@ -1,4 +1,8 @@
-use super::{Connection, Header, Listener, SocketName};
+use super::{
+    ACKED_USER_MESSAGE, ACKED_USER_RESPONSE, ACKED_USER_RESPONSE_PAYLOAD_SIZE, Connection, Header,
+    Listener, SocketName, USER, checked_user_kind, decode_acked_user_message,
+    encode_acked_user_response,
+};
 use crate::{Error, LoopAction};
 use polling::{Event, Poller};
 use std::io::ErrorKind;
@@ -6,6 +10,51 @@ use std::time::{Duration, Instant};
 
 /// The size of the fixed message header prefixed to every IPC message.
 const HEADER_SIZE: usize = std::mem::size_of::<Header>();
+
+/// Sends one complete server-to-client frame.
+///
+/// Client sockets are non-blocking here, so a byte-stream write can be short and
+/// has to be resumed; on SEQPACKET it cannot be, and resending the remainder
+/// would produce a second datagram rather than finish the first frame. A frame
+/// that cannot be delivered leaves the client waiting, so every caller drops the
+/// connection on failure — closing the socket is what turns the client's wait
+/// into a prompt error instead of a hang.
+fn send_frame(socket: &Connection, kind: u32, payload: &[u8]) -> std::io::Result<()> {
+    debug_assert!(payload.len() <= ACKED_USER_RESPONSE_PAYLOAD_SIZE);
+
+    let header = Header {
+        kind,
+        size: payload.len() as u32,
+    };
+    let mut frame = [0; HEADER_SIZE + ACKED_USER_RESPONSE_PAYLOAD_SIZE];
+    let frame_len = HEADER_SIZE + payload.len();
+    frame[..HEADER_SIZE].copy_from_slice(header.as_bytes());
+    frame[HEADER_SIZE..frame_len].copy_from_slice(payload);
+
+    let mut offset = 0;
+    while offset < frame_len {
+        match socket.send(&frame[offset..frame_len]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "IPC socket write made no progress",
+                ));
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Ok(written) if written != frame_len => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "IPC seqpacket response was only partially written",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
 
 /// The outcome of attempting to receive a message from a client connection.
 enum RecvOutcome {
@@ -37,9 +86,16 @@ fn classify(err: std::io::Error) -> RecvOutcome {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 enum RecvState {
     /// Accumulating the fixed-size header.
-    Header { bytes: [u8; HEADER_SIZE], filled: usize },
+    Header {
+        bytes: [u8; HEADER_SIZE],
+        filled: usize,
+    },
     /// Header parsed; accumulating `filled` of `buffer.len()` payload bytes.
-    Payload { kind: u32, buffer: Vec<u8>, filled: usize },
+    Payload {
+        kind: u32,
+        buffer: Vec<u8>,
+        filled: usize,
+    },
 }
 
 /// Server side of the connection, which runs in the monitor process that is
@@ -541,12 +597,7 @@ impl Server {
                                             }
                                         };
 
-                                    let ack = Header {
-                                        kind: super::CRASH_ACK,
-                                        size: 0,
-                                    };
-
-                                    if let Err(err) = cc.socket.send(ack.as_bytes()) {
+                                    if let Err(err) = send_frame(&cc.socket, super::CRASH_ACK, &[]) {
                                         log::error!("failed to send ack: {err}");
                                     }
 
@@ -560,12 +611,9 @@ impl Server {
                             }
                         }
                         RecvOutcome::Message(super::PING, _buffer) => {
-                            let pong = Header {
-                                kind: super::PONG,
-                                size: 0,
-                            };
-
-                            if let Err(err) = polling.clients[pos].socket.send(pong.as_bytes()) {
+                            if let Err(err) =
+                                send_frame(&polling.clients[pos].socket, super::PONG, &[])
+                            {
                                 log::error!("failed to send PONG: {err}");
 
                                 let cc = polling.clients.swap_remove(pos);
@@ -575,18 +623,38 @@ impl Server {
                             }
                         }
                         RecvOutcome::Message(super::PONG, _buffer) => None,
-                        RecvOutcome::Message(kind, buffer) => {
+                        RecvOutcome::Message(ACKED_USER_MESSAGE, buffer) => {
+                            if let Err(err) = Self::handle_acked_user_message(
+                                &polling.clients[pos].socket,
+                                handler.as_ref(),
+                                buffer,
+                            ) {
+                                log::error!("failed to acknowledge a user message: {err}");
+
+                                let cc = polling.clients.swap_remove(pos);
+                                Some(cc.socket)
+                            } else {
+                                None
+                            }
+                        }
+                        RecvOutcome::Message(kind, buffer)
+                            if (USER..ACKED_USER_MESSAGE).contains(&kind) =>
+                        {
                             handler.on_message(
-                                kind - super::USER, /* give the user back the original code they specified */
+                                kind - USER, /* give the user back the original code they specified */
                                 buffer,
                             );
 
-                            // We only send acks for crash dump requests
-                            // if let Err(e) = clients[pos].socket.send(&[1]) {
-                            //     log::error!("failed to send ack: {}", e);
-                            // }
-
                             None
+                        }
+                        RecvOutcome::Message(kind, _buffer) => {
+                            // Neither a protocol frame the server answers nor a
+                            // user message it can decode, so the connection is
+                            // no longer trustworthy.
+                            log::error!("received an unknown IPC message kind {kind}");
+
+                            let cc = polling.clients.swap_remove(pos);
+                            Some(cc.socket)
                         }
                         RecvOutcome::Pending => None,
                         RecvOutcome::Eof => {
@@ -646,6 +714,24 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Runs the handler's acceptance check for an acknowledged user message and
+    /// reports its verdict back to the client.
+    fn handle_acked_user_message(
+        socket: &Connection,
+        handler: &dyn crate::ServerHandler,
+        buffer: Vec<u8>,
+    ) -> Result<(), Error> {
+        let (request_id, user_kind, payload) = decode_acked_user_message(buffer)?;
+        // The client refuses to send reserved kinds, so seeing one means the
+        // frame is not what it claims to be.
+        checked_user_kind(user_kind)?;
+
+        let status = handler.on_acknowledged_message(user_kind, payload);
+        let response = encode_acked_user_response(request_id, status);
+
+        Ok(send_frame(socket, ACKED_USER_RESPONSE, &response)?)
     }
 
     fn handle_crash_request(
