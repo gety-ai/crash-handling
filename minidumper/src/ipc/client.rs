@@ -13,6 +13,18 @@ use std::{
 
 const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 
+/// How long a crash request waits for another caller to finish with the socket.
+///
+/// It has to be bounded: the crash may have interrupted the very thread that
+/// holds the lock, and this mutex is not reentrant. Waiting a little first still
+/// lets an ordinary in-flight `send_message` complete, which is the difference
+/// between losing a minidump and merely delaying it.
+///
+/// macOS sends crash contexts over its mach port instead, so it never contends
+/// for this lock.
+#[cfg(not(target_os = "macos"))]
+const CRASH_REQUEST_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A complete frame sent by the server to the client. Every one of these can
 /// show up on the socket at any time, so a waiter has to route them rather than
 /// assume the next frame is the one it asked for.
@@ -175,9 +187,11 @@ struct ClientIo {
     /// must be discarded instead of being mistaken for a protocol violation by
     /// whoever waits next — in practice the `CRASH_ACK` of the minidump request.
     abandoned_ack_ids: HashSet<u64>,
-    /// Cleared once the frame boundary is no longer known, after which reading
-    /// on can only produce garbage.
-    recv_usable: bool,
+    /// Cleared once the frame boundary is no longer known — either because a
+    /// response could not be decoded, or because a frame was only partly
+    /// written. Reading or writing on from there can only produce garbage, so
+    /// every later call fails instead.
+    usable: bool,
 }
 
 impl ClientIo {
@@ -186,15 +200,35 @@ impl ClientIo {
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             recv: ResponseRecvState::new(),
             abandoned_ack_ids: HashSet::new(),
-            recv_usable: true,
+            usable: true,
         }
     }
 
-    fn ensure_recv_usable(&self) -> Result<(), Error> {
-        if self.recv_usable {
+    fn ensure_usable(&self) -> Result<(), Error> {
+        if self.usable {
             Ok(())
         } else {
             Err(Error::ProtocolError("the IPC response stream is unusable"))
+        }
+    }
+
+    /// Writes one whole frame, giving up on the connection if it cannot.
+    ///
+    /// A byte-stream write can fail after part of a frame is already out. There
+    /// is no way to finish that frame afterwards, so appending the next one
+    /// would silently desynchronise the server; the connection is retired
+    /// instead. Protocol errors are raised before the socket is touched and
+    /// leave it intact.
+    fn write_frame(&mut self, socket: &Stream, kind: u32, payload: &[u8]) -> Result<(), Error> {
+        self.ensure_usable()?;
+
+        match send_frame(socket, kind, payload) {
+            Ok(()) => Ok(()),
+            Err(err @ Error::Io(_)) => {
+                self.usable = false;
+                Err(err)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -219,7 +253,7 @@ impl ClientIo {
                 Ok(RouteOutcome::Complete(None))
             }
             _ => {
-                self.recv_usable = false;
+                self.usable = false;
                 Err(Error::ProtocolError("received an unexpected IPC response"))
             }
         }
@@ -251,7 +285,7 @@ impl ClientIo {
         match set_stream_read_timeout(socket, None) {
             Ok(()) => result,
             Err(err) => {
-                self.recv_usable = false;
+                self.usable = false;
                 Err(result.err().unwrap_or_else(|| err.into()))
             }
         }
@@ -263,7 +297,7 @@ impl ClientIo {
         expected: ExpectedResponse,
         deadline: Option<Instant>,
     ) -> Result<Option<MessageAck>, Error> {
-        self.ensure_recv_usable()?;
+        self.ensure_usable()?;
 
         loop {
             let remaining = match deadline {
@@ -290,7 +324,7 @@ impl ClientIo {
                     continue;
                 }
                 Err(err) => {
-                    self.recv_usable = false;
+                    self.usable = false;
                     return Err(err);
                 }
             };
@@ -487,9 +521,16 @@ impl Client {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let mut io = self.io.lock();
-            io.ensure_recv_usable()?;
-            send_frame(&self.socket, CRASH, crash_ctx_buffer)?;
+            // A crash can interrupt the very thread that is holding this lock,
+            // and it is not reentrant, so waiting unconditionally would turn the
+            // crash into a permanent hang of the crashing process.
+            let mut io =
+                self.io
+                    .try_lock_for(CRASH_REQUEST_LOCK_TIMEOUT)
+                    .ok_or(Error::ProtocolError(
+                        "the IPC client was still busy when the crash request arrived",
+                    ))?;
+            io.write_frame(&self.socket, CRASH, crash_ctx_buffer)?;
 
             // Writing the minidump is unbounded, so this wait must be too; a
             // late acknowledged-message response is discarded rather than
@@ -526,8 +567,8 @@ impl Client {
     pub fn send_message(&self, kind: u32, buf: impl AsRef<[u8]>) -> Result<(), Error> {
         let wire_kind = checked_user_kind(kind)?;
 
-        let _io = self.io.lock();
-        send_frame(&self.socket, wire_kind, buf.as_ref())
+        let mut io = self.io.lock();
+        io.write_frame(&self.socket, wire_kind, buf.as_ref())
     }
 
     /// Sends a message to the server and waits for the handler's verdict on it.
@@ -550,22 +591,26 @@ impl Client {
         checked_user_kind(kind)?;
 
         let mut io = self.io.lock();
-        io.ensure_recv_usable()?;
+        io.ensure_usable()?;
 
         // Allocated under the lock so request ids and wire order agree.
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let payload = encode_acked_user_message(request_id, kind, buf.as_ref());
 
-        let result = send_frame(&self.socket, ACKED_USER_MESSAGE, &payload).and_then(|()| {
-            io.wait_for(
-                &self.socket,
-                ExpectedResponse::Ack(request_id),
-                Some(timeout),
-            )?
-            .ok_or(Error::ProtocolError(
-                "acknowledged user message returned no status",
-            ))
-        });
+        let result = match io.write_frame(&self.socket, ACKED_USER_MESSAGE, &payload) {
+            Ok(()) => io
+                .wait_for(
+                    &self.socket,
+                    ExpectedResponse::Ack(request_id),
+                    Some(timeout),
+                )
+                .and_then(|status| {
+                    status.ok_or(Error::ProtocolError(
+                        "acknowledged user message returned no status",
+                    ))
+                }),
+            Err(err) => Err(err),
+        };
 
         if result.is_err() {
             io.abandoned_ack_ids.insert(request_id);
@@ -583,8 +628,7 @@ impl Client {
     #[inline]
     pub fn ping(&self) -> Result<(), Error> {
         let mut io = self.io.lock();
-        io.ensure_recv_usable()?;
-        send_frame(&self.socket, PING, &[])?;
+        io.write_frame(&self.socket, PING, &[])?;
         io.wait_for(&self.socket, ExpectedResponse::Pong, None)?;
         Ok(())
     }
@@ -610,7 +654,14 @@ fn send_frame(socket: &Stream, kind: u32, buf: &[u8]) -> Result<(), Error> {
             IoSlice::new(&buf[payload_offset..]),
         ];
 
-        let written = socket.send_vectored(&io_bufs)?;
+        let written = match socket.send_vectored(&io_bufs) {
+            Ok(written) => written,
+            // A signal is not a framing failure, and giving up here would retire
+            // a connection that is still perfectly good.
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
+
         if written == 0 {
             return Err(std::io::Error::new(
                 ErrorKind::WriteZero,
@@ -701,7 +752,7 @@ mod tests {
                 .unwrap(),
             RouteOutcome::Complete(None)
         );
-        assert!(io.recv_usable);
+        assert!(io.usable);
         assert!(io.abandoned_ack_ids.is_empty());
     }
 
@@ -719,7 +770,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(!io.recv_usable);
+        assert!(!io.usable);
     }
 
     #[test]
@@ -730,8 +781,8 @@ mod tests {
             io.route_response(ExpectedResponse::Pong, ResponseFrame::CrashAck)
                 .is_err()
         );
-        assert!(!io.recv_usable);
-        assert!(io.ensure_recv_usable().is_err());
+        assert!(!io.usable);
+        assert!(io.ensure_usable().is_err());
     }
 
     /// A byte-stream peer may split a frame anywhere, so the decoder has to

@@ -63,6 +63,31 @@ impl minidumper::ServerHandler for LegacyHandler {
     }
 }
 
+/// A server that dies *after* taking the request, so the client is already
+/// blocked waiting when the socket closes under it.
+struct DyingHandler;
+
+impl minidumper::ServerHandler for DyingHandler {
+    fn create_minidump_file(&self) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+        panic!("should not be called");
+    }
+
+    fn on_minidump_created(
+        &self,
+        _result: Result<minidumper::MinidumpBinary, minidumper::Error>,
+    ) -> minidumper::LoopAction {
+        panic!("should not be called");
+    }
+
+    fn on_message(&self, _kind: u32, _buffer: Vec<u8>) {
+        panic!("should not be called");
+    }
+
+    fn on_acknowledged_message(&self, _kind: u32, _buffer: Vec<u8>) -> minidumper::MessageAck {
+        panic!("synthetic reporter death while holding the request");
+    }
+}
+
 struct TestServer {
     name: String,
     shutdown: Arc<atomic::AtomicBool>,
@@ -265,19 +290,26 @@ fn a_late_response_is_discarded_by_the_next_wait() {
 }
 
 #[test]
-fn a_disconnected_server_fails_the_wait_instead_of_hanging() {
-    let mut server = TestServer::start(
-        "disconnect",
-        LegacyHandler {
-            messages: Messages::default(),
-        },
-    );
-    let client = server.connect();
-    server.stop();
+fn a_server_that_dies_mid_wait_fails_the_request_instead_of_hanging() {
+    let name = format!("minidumper-dying-{}", uuid::Uuid::new_v4().as_simple());
+    let mut server = minidumper::Server::with_name(minidumper::SocketName::path(&name)).unwrap();
+    let shutdown = Arc::new(atomic::AtomicBool::new(false));
+    let is_shutdown = shutdown.clone();
+
+    // The handler panics, so the server loop unwinds and drops the accepted
+    // connection while the client is already blocked on its response — the
+    // timeout must not be what rescues it.
+    let server_loop =
+        std::thread::spawn(move || server.run(Box::new(DyingHandler), &is_shutdown, None));
+    let client = minidumper::Client::with_name(minidumper::SocketName::path(&name)).unwrap();
 
     assert!(
         client
-            .send_message_acked(11, b"gone", Duration::from_secs(5))
+            .send_message_acked(11, b"gone", Duration::from_secs(30))
             .is_err()
+    );
+    assert!(
+        server_loop.join().is_err(),
+        "the server loop must have died"
     );
 }
